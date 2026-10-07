@@ -1,0 +1,101 @@
+name: Mise à jour EWAM (vagues DWD)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Reconstruire même si ce run est déjà publié"
+        type: boolean
+        default: false
+  schedule:
+    # Best-effort côté GitHub ; la route /api/cron/lancer-modeles du site relance aussi ce workflow.
+    # Un passage « sans nouveau run » ne coûte que quelques requêtes HEAD.
+    - cron: "25 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-ewam
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer les dépendances
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Produire les grilles EWAM
+        id: build
+        run: |
+          set -o pipefail
+          for attempt in 1 2 3; do
+            if python scripts/update_ewam.py \
+              --output-dir build/national \
+              --current-metadata-url "https://raw.githubusercontent.com/${{ github.repository }}/data/index.json" \
+              ${{ inputs.force && '--force' || '' }} 2>&1 | tee "$RUNNER_TEMP/tentative.log"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Échec après 3 tentatives"
+              exit 1
+            fi
+            echo "Échec (tentative $attempt), nouvelle tentative dans 60 s"
+            sleep 60
+          done
+          if test -f build/national/index.json; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Rien à publier (run déjà à jour ou pas encore complet)."
+          fi
+
+      - name: Vérifier la publication
+        if: steps.build.outputs.publish == 'true'
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("build/national")
+          index = json.loads((root / "index.json").read_text(encoding="utf-8"))
+          maps = json.loads((root / "maps/index.json").read_text(encoding="utf-8"))
+          assert index["status"] == "ok"
+          assert len(maps["steps"]) >= 30, "trop peu d'échéances"
+          missing = [s["lead_hour"] for s in maps["steps"] if "hs" not in s["probes"] or "dir" not in s["probes"]]
+          assert not missing, f"échéances sans hauteur/direction : {missing}"
+          for s in maps["steps"]:
+              for rel in s["probes"].values():
+                  assert (root / rel).is_file(), rel
+          print(f"Validation OK : {len(maps['steps'])} échéances, run {maps['run_time']}")
+          PY
+
+      - name: Publier sur la branche data
+        if: steps.build.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          publish_dir="$(mktemp -d)"
+          cp -a build/national/. "$publish_dir/"
+          touch "$publish_dir/.nojekyll"
+          cd "$publish_dir"
+          git init -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all
+          git commit -m "Données EWAM $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPOSITORY}.git"
+          git push --force origin data
